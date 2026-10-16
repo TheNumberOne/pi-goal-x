@@ -38,6 +38,8 @@ Implementation log.
   (`maxAutonomousRuns: 0`); a throwing `sendUserMessage` notifies with
   severity `error` and the resume path still runs. Registered the new file
   in `tests/.test-manifest.json` via `--write-manifest` (78 unit entries).
+## Round 2 — review fixes (2026-10-16)
+
 - Review fix (independent review, verdict "OK with notes", no blockers):
   corrected the ordering rationale above — `ctx.hasPendingMessages()` only
   counts queued steer/followUp messages, so it cannot see an idle-time user
