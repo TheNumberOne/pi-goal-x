@@ -12,11 +12,14 @@ import { buildGoalCreatedReport, formatGoalBudget } from "./goal-policy.ts";
 import { loadGoalSettings } from "./goal-settings.ts";
 import { DIALOG_UNAVAILABLE_HINT, proposalDialogFailureMessage, formatQuestionnaireAnswers, runGoalQuestionnaire, shouldAutoConfirmProposal, showProposalDialog, type GoalQuestionnaireQuestion, type ProposalDecision } from "./goal-questionnaire.ts";
 import { currentTaskIdIsPending, nowIso, validateTokenBudgetInput, type GoalRecord, type GoalTaskList } from "./goal-record.ts";
+import { ARCHIVED_GOALS_DIR, isSafeArchivedPath, parseGoalFile, resolveGoalPath, scanArchivedGoalFiles } from "./storage/goal-files.ts";
+import { latestAuditorResultForGoal, readGoalLedger } from "./goal-ledger.ts";
+import { buildRerunProvenance } from "./goal-policy.ts";
 import type { GoalCore } from "./goal-state.ts";
 import { convertFlatTasks, countTasks, mergeTasksWithExisting, type FlatTaskInput } from "./goal-task-tools.ts";
 import { PROPOSE_DRAFT_TOOL_NAME, QUESTIONNAIRE_TOOL_NAME, QUESTION_TOOL_NAME } from "./goal-tool-names.ts";
 
-export type GoalDraftMode = GoalDraftingFocus | "tweak";
+export type GoalDraftMode = GoalDraftingFocus | "tweak" | "rerun";
 
 export const DRAFT_ENTRY = "pi-goal-draft";
 export const DRAFT_ENTRY_VERSION = 1;
@@ -33,6 +36,10 @@ export interface GoalDraftSession {
 	targetGoalId?: string;
 	startedAt: string;
 	auditorEnabled: boolean;
+	/** §rerun: fast-path hint — the source archive is re-resolved by id at propose time. */
+	sourceArchivedPath?: string;
+	/** §rerun: the full rendered rerun seed, used only to build the sendUserMessage prompt. */
+	seedPrompt?: string;
 	/** Tombstone marker: set when the draft is cancelled, confirmed, or replaced. */
 	clearedAt?: string;
 }
@@ -43,6 +50,10 @@ export interface ActiveGoalDraft {
 	targetGoalId?: string;
 	startedAt: string;
 	auditorEnabled: boolean;
+	/** §rerun: fast-path hint — the source archive is re-resolved by id at propose time. */
+	sourceArchivedPath?: string;
+	/** §rerun: the full rendered rerun seed, used only to build the sendUserMessage prompt. */
+	seedPrompt?: string;
 	/** E5: formatted questionnaire Q&A to echo in the created-goal report. */
 	questionnaireEcho?: string;
 }
@@ -64,6 +75,8 @@ export function clearGoalDrafting(core: GoalCore, ctx: ExtensionContext): void {
 	const existing = activeDrafts.get(core)!;
 	activeDrafts.delete(core);
 	// Tombstone the durable entry: the last entry wins on rehydration.
+	// Rerun fields are deliberately NOT re-persisted: the entry is cleared anyway, and
+	// re-appending a ≤8 KB seed on every cancel/confirm bloats the session branch.
 	draftSessionEntry(core, { version: 1, mode: existing.mode, seed: existing.originalTopic, targetGoalId: existing.targetGoalId, startedAt: existing.startedAt, auditorEnabled: existing.auditorEnabled, clearedAt: nowIso() });
 	core.installGoalToolProfile(core.tasksEnabled);
 	void ctx;
@@ -117,7 +130,8 @@ export function rehydrateDraft(core: GoalCore, ctx: ExtensionContext): void {
 			return;
 		}
 	}
-	activeDrafts.set(core, { mode: session.mode, originalTopic: session.seed, targetGoalId: session.targetGoalId, startedAt: session.startedAt, auditorEnabled: session.auditorEnabled });
+	// §rerun-threading: carry the rerun fields through the field-by-field rebuild (G1).
+	activeDrafts.set(core, { mode: session.mode, originalTopic: session.seed, targetGoalId: session.targetGoalId, startedAt: session.startedAt, auditorEnabled: session.auditorEnabled, sourceArchivedPath: session.sourceArchivedPath, seedPrompt: session.seedPrompt });
 	core.installDraftingToolProfile();
 }
 
@@ -135,9 +149,9 @@ async function awaitDraftChoice(core: GoalCore, ctx: ExtensionContext, label: st
 	}
 }
 
-export async function startGoalDrafting(core: GoalCore, ctx: ExtensionContext, mode: GoalDraftMode, topic: string, targetGoal?: GoalRecord): Promise<void> {
+export async function startGoalDrafting(core: GoalCore, ctx: ExtensionContext, mode: GoalDraftMode, topic: string, targetGoal?: GoalRecord, rerun?: { sourceArchivedPath: string; seedPrompt: string }): Promise<void> {
 	const trimmed = topic.trim();
-	const label = mode === "sisyphus" ? "Sisyphus draft" : mode === "tweak" ? "Goal tweak draft" : "Goal draft";
+	const label = mode === "sisyphus" ? "Sisyphus draft" : mode === "tweak" ? "Goal tweak draft" : mode === "rerun" ? "Goal rerun draft" : "Goal draft";
 	// A second draft must never silently discard the first.
 	if (activeDraft(core)) {
 		const choice = ctx.hasUI
@@ -163,8 +177,10 @@ export async function startGoalDrafting(core: GoalCore, ctx: ExtensionContext, m
 	const auditorEnabled = mode === "tweak"
 		? !(targetGoal?.skipAuditor ?? loadGoalSettings(ctx.cwd).disabled)
 		: !loadGoalSettings(ctx.cwd).disabled;
-	activeDrafts.set(core, { mode, originalTopic: trimmed, targetGoalId: targetGoal?.id, startedAt, auditorEnabled });
-	draftSessionEntry(core, { version: 1, mode, seed: trimmed, targetGoalId: targetGoal?.id, startedAt, auditorEnabled });
+	// §rerun-threading: only the rerun branch carries the source hint + full seed (G1: these fields must survive every rebuild site).
+	const rerunFields = mode === "rerun" && rerun ? { sourceArchivedPath: rerun.sourceArchivedPath, seedPrompt: rerun.seedPrompt } : {};
+	activeDrafts.set(core, { mode, originalTopic: trimmed, targetGoalId: targetGoal?.id, startedAt, auditorEnabled, ...rerunFields });
+	draftSessionEntry(core, { version: 1, mode, seed: trimmed, targetGoalId: targetGoal?.id, startedAt, auditorEnabled, ...rerunFields });
 	core.clearContinuationState();
 	core.clearActiveAccounting();
 	core.installDraftingToolProfile();
@@ -177,7 +193,12 @@ export async function startGoalDrafting(core: GoalCore, ctx: ExtensionContext, m
 		formatGoalBudget(targetGoal?.tokenBudget),
 		"Current objective:", targetGoal?.objective ?? "(goal no longer available)",
 		"User request:", trimmed || "(ask what they want to change)",
-	].join("\n") : goalDraftingPrompt(trimmed, mode);
+	].join("\n")
+		: mode === "rerun"
+		// §rerun-seed: the seed is pre-rendered by the command layer; never rebuild it here.
+		// A rerun draft always starts through handleGoalRerun, which always supplies the seed.
+		? rerun!.seedPrompt
+		: goalDraftingPrompt(trimmed, mode);
 	try {
 		core.pi.sendUserMessage(prompt, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
 	} catch (err) {
@@ -195,9 +216,13 @@ function proposedTaskList(core: GoalCore, ctx: ExtensionContext, tasks: FlatTask
 }
 
 export function proposalText(draft: ActiveGoalDraft, objective: string, autoContinue: boolean, taskList: GoalTaskList | undefined, current?: GoalRecord, tokenBudget?: number | null): string {
+	// §rerun (G6): the confirmation dialog must reflect the mode the sibling will
+	// actually get — a Sisyphus-source rerun renders as Sisyphus even though
+	// draft.mode is "rerun".
+	const focus: GoalDraftingFocus = draft.mode === "sisyphus" || (draft.mode === "rerun" && current?.sisyphus === true) ? "sisyphus" : "goal";
 	const base = draft.mode === "tweak" && current
 		? buildTweakConfirmationText({ currentObjective: current.objective, newObjective: objective, changeSummary: draft.originalTopic || "Goal revised through guided drafting.", sisyphus: current.sisyphus, tasks: taskList?.tasks })
-		: buildDraftConfirmationText({ focus: draft.mode === "sisyphus" ? "sisyphus" : "goal", originalTopic: draft.originalTopic, objective, autoContinue });
+		: buildDraftConfirmationText({ focus, originalTopic: draft.originalTopic, objective, autoContinue });
 	// The task list is always shown exactly once in a proposal: explicitly
 	// proposed tasks, or (new drafts) tasks derived from the RAW objective, or
 	// (tweaks) the current goal's list when it is retained unchanged. Deriving
@@ -223,7 +248,33 @@ export function proposalText(draft: ActiveGoalDraft, objective: string, autoCont
 			tasksText = "\n\nTasks derived from the objective (confirm or ask the agent to adjust):\n" + renderConfirmationTasks(derived, 0).join("\n");
 		}
 	}
-	return `${draft.mode === "tweak" ? `Current ${formatGoalBudget(current?.tokenBudget)}\nProposed ${formatGoalBudget(tokenBudget === undefined ? current?.tokenBudget : tokenBudget ?? undefined)}` : formatGoalBudget(tokenBudget ?? undefined)}\n\n${base}${tasksText}`;
+	// §rerun (G7): rerun defaults token_budget to the source budget, so the dialog must show the same Current/Proposed pair tweak does — never "none".
+	return `${draft.mode === "tweak" || draft.mode === "rerun" ? `Current ${formatGoalBudget(current?.tokenBudget)}\nProposed ${formatGoalBudget(tokenBudget === undefined ? current?.tokenBudget : tokenBudget ?? undefined)}` : formatGoalBudget(tokenBudget ?? undefined)}\n\n${base}${tasksText}`;
+}
+
+/**
+ * §rerun: resolve the completed source goal for an active rerun draft. The
+ * source is resolved by id from the archive scan; sourceArchivedPath is only a
+ * fast-path hint (G1: it can be dropped by older durable entries).
+ * parseGoalFile requires an ABSOLUTE path — always resolve via resolveGoalPath.
+ */
+function resolveRerunSourceGoal(ctx: ExtensionContext, draft: ActiveGoalDraft): GoalRecord | undefined {
+	if (!draft.targetGoalId) return undefined;
+	if (draft.sourceArchivedPath && isSafeArchivedPath(ctx, draft.sourceArchivedPath)) {
+		const hinted = parseGoalFile(resolveGoalPath(ctx, ARCHIVED_GOALS_DIR, draft.sourceArchivedPath));
+		if (hinted && hinted.status === "complete" && hinted.id === draft.targetGoalId) return { ...hinted, archivedPath: draft.sourceArchivedPath };
+	}
+	return scanArchivedGoalFiles(ctx).find((goal) => goal.id === draft.targetGoalId && goal.status === "complete");
+}
+
+/** Last completion_requested.summary for a goal, when the ledger recorded one. */
+export function lastCompletionSummary(ctx: ExtensionContext, goalId: string): string | undefined {
+	const events = readGoalLedger(ctx).events;
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i];
+		if (event && event.type === "completion_requested" && event.goalId === goalId && event.summary?.trim()) return event.summary;
+	}
+	return undefined;
 }
 
 function flatTaskSchema() {
@@ -309,7 +360,7 @@ export function registerDraftingTools(core: GoalCore): void {
 		description: "Present the drafted objective and agent-selected task plan for explicit user confirmation.",
 		promptSnippet: "Confirm the proposed goal and any useful task tree in one dialog.",
 		promptGuidelines: [
-			"Use only during a /goal, /sisyphus, or /goal-tweak guided draft.",
+			"Use only during a /goal, /sisyphus, /goal-tweak, or /goal-rerun guided draft.",
 			"Clarify ambiguity before proposing. Include tasks when the work naturally decomposes into trackable milestones; omit them for genuinely simple work.",
 			"Set token_budget only when the user explicitly asked for a token budget or a spend limit. Never invent, estimate, or infer one from the objective's size; omitting it creates a goal with no budget.",
 			"Confirmation creates or revises the goal atomically. Continue Chatting leaves drafting active for refinement.",
@@ -334,7 +385,10 @@ export function registerDraftingTools(core: GoalCore): void {
 			if (!objective) return { content: [{ type: "text", text: "The proposed objective must be at least 1 character." }], details: goalDetails(core.state.goal) };
 			const objectiveMaxChars = loadGoalSettings(ctx.cwd).objectiveMaxChars ?? 0;
 			if (objectiveMaxChars > 0 && objective.length > objectiveMaxChars) return { content: [{ type: "text", text: `The proposed objective must be at most ${objectiveMaxChars} characters (${objective.length} given).` }], details: goalDetails(core.state.goal) };
-			const expectedSisyphus = draft.mode === "sisyphus";
+			// §rerun: resolve the source ONCE per proposal (one archive scan); it feeds the
+			// sisyphus gate, the budget "current", the dialog, and the confirm-time guard.
+			const rerunSource = draft.mode === "rerun" ? resolveRerunSourceGoal(ctx, draft) : undefined;
+			const expectedSisyphus = draft.mode === "rerun" ? rerunSource?.sisyphus ?? false : draft.mode === "sisyphus";
 			if (draft.mode !== "tweak" && ((params.sisyphus === true) !== expectedSisyphus)) return { content: [{ type: "text", text: "Proposal mode does not match the command that began this draft." }], details: goalDetails(core.state.goal) };
 			const taskResult = proposedTaskList(core, ctx, params.tasks as FlatTaskInput[] | undefined, params.block_completion);
 			if (!taskResult.ok) return { content: [{ type: "text", text: taskResult.message }], details: goalDetails(core.state.goal) };
@@ -342,20 +396,28 @@ export function registerDraftingTools(core: GoalCore): void {
 			if (flushError || core.goalService.isTurnBuffered()) return {content: [{type: "text", text: "Proposal not saved: " + (flushError ?? "goal changes are still buffered")}], details: goalDetails(core.state.goal)};
 			core.reconcileFocusedGoalFromDisk(ctx);
 			const target = draft.mode === "tweak" ? core.state.goal : undefined;
+			// §rerun (G7): the budget "current" is the source goal in rerun mode, so an omitted token_budget defaults to the carried budget.
+			const budgetCurrent = draft.mode === "rerun" ? rerunSource : target;
 			if (draft.mode === "tweak" && (!target || target.id !== draft.targetGoalId)) return { content: [{ type: "text", text: "The goal changed while drafting; review it and start /goal-tweak again." }], details: goalDetails(core.state.goal) };
 			if (target?.status === "complete") return {content: [{type: "text", text: "Completed goals cannot be tweaked."}], details: goalDetails(target)};
 			const proposalToken = target ? core.focusedOperationToken(target.id) : undefined;
 			const proposalRevision = target?.revision ?? 0;
-			const proposedBudget = params.token_budget === undefined ? target?.tokenBudget : params.token_budget ?? undefined;
-			const budgetSummary = target ? `Current ${formatGoalBudget(target.tokenBudget)}\nProposed ${formatGoalBudget(proposedBudget)}` : formatGoalBudget(proposedBudget);
-			if (draft.mode === "sisyphus" && !sisyphusObjectiveSufficient(objective)) return { content: [{ type: "text", text: "A Sisyphus goal needs ordered steps with explicit per-step done criteria. Refine the objective with numbered steps (1) ..., 2) ...) or Step N: blocks before proposing again." }], details: goalDetails(core.state.goal) };
+			const proposedBudget = params.token_budget === undefined ? budgetCurrent?.tokenBudget : params.token_budget ?? undefined;
+			const budgetSummary = budgetCurrent ? `Current ${formatGoalBudget(budgetCurrent.tokenBudget)}\nProposed ${formatGoalBudget(proposedBudget)}` : formatGoalBudget(proposedBudget);
+			if (expectedSisyphus && !sisyphusObjectiveSufficient(objective)) return { content: [{ type: "text", text: "A Sisyphus goal needs ordered steps with explicit per-step done criteria. Refine the objective with numbered steps (1) ..., 2) ...) or Step N: blocks before proposing again." }], details: goalDetails(core.state.goal) };
+			// §rerun: the source must still exist as a completed archive BEFORE the dialog —
+			// a dead rerun never opens a confirm dialog. Abort WITHOUT clearing the draft:
+			// nothing was created and the draft stays usable (TECH §4.4.4).
+			if (draft.mode === "rerun" && !rerunSource) {
+				return { content: [{ type: "text", text: "The source goal for this rerun is no longer available as a completed archive (it may have been deleted or moved). The draft is still active; nothing was created. Run /goal-rerun again to pick a source." }], details: goalDetails(core.state.goal) };
+			}
 			let confirmation: { decision: ProposalDecision; auditorEnabled: boolean; unavailable: boolean };
 			if (shouldAutoConfirmProposal({ hasUI: ctx.hasUI, autoConfirmEnv: process.env.PI_GOAL_AUTO_CONFIRM })) {
 				confirmation = { decision: "confirm" as const, auditorEnabled: draft.auditorEnabled, unavailable: false };
 			} else {
 				core.enterGoalModal();
 				try {
-					confirmation = await showProposalDialog(ctx, proposalText(draft, objective, params.auto_continue !== false, taskResult.value, target ?? undefined, params.token_budget), draft.mode === "sisyphus" ? "sisyphus" : "goal", draft.auditorEnabled);
+					confirmation = await showProposalDialog(ctx, proposalText(draft, objective, params.auto_continue !== false, taskResult.value, draft.mode === "rerun" ? rerunSource : target ?? undefined, params.token_budget), expectedSisyphus ? "sisyphus" : "goal", draft.auditorEnabled);
 				} catch (error) {
 					return { content: [{ type: "text", text: `${proposalDialogFailureMessage(error)} Do not retry the dialog until the host issue is resolved.` }], details: goalDetails(core.state.goal) };
 				} finally {
@@ -387,7 +449,8 @@ export function registerDraftingTools(core: GoalCore): void {
 				if (confirmation.auditorEnabled !== draft.auditorEnabled) {
 					const next = { ...draft, auditorEnabled: confirmation.auditorEnabled };
 					activeDrafts.set(core, next);
-					draftSessionEntry(core, { version: 1, mode: next.mode, seed: next.originalTopic, targetGoalId: next.targetGoalId, startedAt: next.startedAt, auditorEnabled: next.auditorEnabled });
+					// §rerun-threading (G1): the durable rewrite must carry the rerun fields or rehydration drops them.
+					draftSessionEntry(core, { version: 1, mode: next.mode, seed: next.originalTopic, targetGoalId: next.targetGoalId, startedAt: next.startedAt, auditorEnabled: next.auditorEnabled, sourceArchivedPath: next.sourceArchivedPath, seedPrompt: next.seedPrompt });
 				}
 				return { content: [{ type: "text", text: `${summary}\n\nGoal draft refinement requested. The goal was not changed; ask what the user wants revised before proposing again.` }], details: goalDetails(core.state.goal) };
 			}
@@ -402,12 +465,16 @@ export function registerDraftingTools(core: GoalCore): void {
 					const derived = deriveTasksFromObjective(extracted.objective);
 					return derived && derived.length > 0 ? { tasks: derived, blockCompletion: false, proposedAt: nowIso() } : undefined;
 				})();
-				core.replaceGoal({ objective: extracted.objective, autoContinue: params.auto_continue !== false, sisyphus: expectedSisyphus, taskList: effectiveTaskList, skipAuditor }, ctx, true, extracted.verificationContract, proposedBudget);
+				// §rerun: provenance snapshot taken at confirm time so provenance and the pre-draft summary agree.
+				const rerunOf = draft.mode === "rerun" && rerunSource
+					? buildRerunProvenance(rerunSource, latestAuditorResultForGoal(readGoalLedger(ctx).events, rerunSource.id), lastCompletionSummary(ctx, rerunSource.id), nowIso())
+					: undefined;
+				core.replaceGoal({ objective: extracted.objective, autoContinue: params.auto_continue !== false, sisyphus: expectedSisyphus, taskList: effectiveTaskList, skipAuditor, ...(rerunOf ? { rerunOf } : {}) }, ctx, true, extracted.verificationContract, proposedBudget);
 				clearGoalDrafting(core, ctx);
 				const created = core.state.goal;
 				return { content: [{ type: "text", text: `${summary}\n\n${buildGoalCreatedReport({
 					objective: extracted.objective,
-					detailedSummary: qaEcho,
+					detailedSummary: [qaEcho, rerunOf ? `Rerun of: ${rerunOf.goalId}` : undefined].filter((part) => part?.trim()).join("\n") || undefined,
 					confirmed: true,
 					goalId: created?.id,
 					filePath: created?.activePath,

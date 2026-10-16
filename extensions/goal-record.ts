@@ -32,6 +32,15 @@ export interface GoalUsage {
 	activeSeconds: number;
 }
 
+/** Provenance for a goal created by /goal-rerun from a completed source goal. */
+export interface GoalRerunProvenance {
+	goalId: string;
+	archivedPath: string;
+	at: string;
+	summary?: string;
+	auditVerdict?: "approved" | "disapproved" | "error";
+}
+
 export interface GoalRecord {
 	id: string;
 	objective: string;
@@ -43,6 +52,8 @@ export interface GoalRecord {
 	updatedAt: string;
 	activePath?: string;
 	archivedPath?: string;
+	/** Set only on goals created via /goal-rerun; absent for every other goal. */
+	rerunOf?: GoalRerunProvenance;
 	stopReason?: StopReason;
 	// Set when the model reports the goal blocked. Cleared when the goal becomes active again.
 	pauseReason?: string;
@@ -143,6 +154,8 @@ export interface GoalCreationConfig {
 	taskList?: GoalTaskList;
 	/** User-chosen per-draft auditor bypass, persisted on the created goal. */
 	skipAuditor?: boolean;
+	/** Rerun provenance, threaded to GoalRecord.rerunOf by createGoal. */
+	rerunOf?: GoalRerunProvenance;
 }
 
 export interface AssistantUsage {
@@ -232,6 +245,29 @@ export function createGoal(config: GoalCreationConfig, now = Date.now()): GoalRe
 		revision: 0,
 		createdAt: timestamp,
 		updatedAt: timestamp,
+		...(config.rerunOf ? { rerunOf: config.rerunOf } : {}),
+	};
+}
+
+/**
+ * Normalize persisted /goal-rerun provenance. Rejects garbage shapes entirely
+ * (returns undefined) rather than half-building an object; path safety is
+ * enforced separately by sanitizeGoalPaths in the storage layer.
+ */
+export function normalizeGoalRerunProvenance(value: unknown): GoalRerunProvenance | undefined {
+	const raw = asRecord(value);
+	if (!raw) return undefined;
+	const goalId = typeof raw.goalId === "string" && raw.goalId.trim() ? safeIdPart(raw.goalId.trim()) : "";
+	const archivedPath = typeof raw.archivedPath === "string" && raw.archivedPath.trim() ? normalizeRelPath(raw.archivedPath.trim()) : "";
+	if (!goalId || !archivedPath) return undefined;
+	const verdict = raw.auditVerdict === "approved" || raw.auditVerdict === "disapproved" || raw.auditVerdict === "error" ? raw.auditVerdict : undefined;
+	const summary = typeof raw.summary === "string" && raw.summary.trim() ? raw.summary.slice(0, 500) : undefined;
+	return {
+		goalId,
+		archivedPath,
+		at: typeof raw.at === "string" ? raw.at : nowIso(),
+		...(verdict ? { auditVerdict: verdict } : {}),
+		...(summary ? { summary } : {}),
 	};
 }
 
@@ -362,6 +398,10 @@ export function normalizeGoalRecord(value: unknown): GoalRecord | null {
 		typeof raw.currentTaskId === "string" && currentTaskIdIsPending(taskList?.tasks, raw.currentTaskId.trim())
 			? raw.currentTaskId.trim()
 			: undefined;
+	// Emit rerunOf CONDITIONALLY (like scheduler below): a record without
+	// provenance must not gain an own `rerunOf: undefined` key, so historical
+	// files stay byte-identical on rewrite and the golden fixture matches.
+	const rerunOf = raw.rerunOf !== undefined ? normalizeGoalRerunProvenance(raw.rerunOf) : undefined;
 
 	return {
 		id: typeof raw.id === "string" && raw.id ? safeIdPart(raw.id) : newGoalId(),
@@ -374,6 +414,7 @@ export function normalizeGoalRecord(value: unknown): GoalRecord | null {
 		updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : timestamp,
 		activePath: typeof raw.activePath === "string" ? raw.activePath : undefined,
 		archivedPath: typeof raw.archivedPath === "string" ? raw.archivedPath : undefined,
+		...(rerunOf ? { rerunOf } : {}),
 		stopReason: raw.stopReason === "agent" || raw.stopReason === "user" ? raw.stopReason : undefined,
 		pauseReason: typeof raw.pauseReason === "string" && raw.pauseReason.trim() ? raw.pauseReason : undefined,
 		pauseSuggestedAction: typeof raw.pauseSuggestedAction === "string" && raw.pauseSuggestedAction.trim() ? raw.pauseSuggestedAction : undefined,

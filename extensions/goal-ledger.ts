@@ -8,7 +8,7 @@ import { nowIso, safeIdPart, type GoalRecord } from "./goal-record.ts";
 export const GOAL_LEDGER_FILE = ".pi/goals/goal_events.jsonl";
 
 export type GoalLedgerEvent =
-  | { type: "goal_created"; goalId: string; objective: string; sisyphus: boolean; autoContinue: boolean; at: string }
+  | { type: "goal_created"; goalId: string; objective: string; sisyphus: boolean; autoContinue: boolean; rerunOf?: string; at: string }
   | { type: "goal_focused"; goalId: string; reason: string; at: string }
   | { type: "goal_unfocused"; reason: string; at: string }
   | { type: "goal_paused"; goalId: string; reason: string; suggestedAction?: string; status?: "paused"; source?: "user" | "agent"; at: string }
@@ -687,7 +687,7 @@ function isValidLedgerEvent(value: unknown): value is GoalLedgerEvent {
   const type = obj.type as GoalLedgerEvent["type"];
   switch (type) {
     case "goal_created":
-      return typeof obj.goalId === "string" && typeof obj.objective === "string" && typeof obj.sisyphus === "boolean" && typeof obj.autoContinue === "boolean";
+      return typeof obj.goalId === "string" && typeof obj.objective === "string" && typeof obj.sisyphus === "boolean" && typeof obj.autoContinue === "boolean" && (obj.rerunOf === undefined || typeof obj.rerunOf === "string");
     case "goal_focused":
       return typeof obj.goalId === "string" && typeof obj.reason === "string";
     case "goal_unfocused":

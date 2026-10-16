@@ -4,6 +4,9 @@ import test from "node:test";
 import {
 	buildCompletionReport,
 	buildGoalCreatedReport,
+	buildRerunProvenance,
+	buildRerunSummary,
+	validateRerunGoal,
 	clearGoalCommandMessage,
 	shouldArmPostCompactReminder,
 	shouldInjectPostCompactReminder,
@@ -13,6 +16,8 @@ import {
 	validateResumeGoal,
 	type GoalPolicyRecordLike,
 } from "../extensions/goal-policy.ts";
+import type { GoalRecord } from "../extensions/goal-record.ts";
+import { detailedSummary, usageLines } from "../extensions/goal-format.ts";
 
 function goal(overrides: Partial<GoalPolicyRecordLike> = {}): GoalPolicyRecordLike {
 	return {
@@ -138,4 +143,96 @@ test("continuation and compaction policies are deterministic", () => {
 	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: sisyphus() }), true);
 	assert.equal(shouldInjectPostCompactReminder({ pending: true, goal: goal({ sisyphus: false }) }), true);
 	assert.equal(shouldInjectPostCompactReminder({ pending: false, goal: sisyphus() }), false);
+});
+
+test("validateRerunGoal accepts only complete goals with status-specific rejections", () => {
+	assert.deepEqual(validateRerunGoal(null), { ok: false, message: "No completed goal to rerun. Use /goal to draft a new one." });
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "paused", autoContinue: false }))), /paused/i);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "paused", autoContinue: false }))), /goal-resume/);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "blocked", autoContinue: false }))), /blocked/i);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "blocked", autoContinue: false }))), /goal-resume/);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "budget_limited", autoContinue: false }))), /budget-limited/i);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "budget_limited", autoContinue: false }))), /goal-resume/);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "active" }))), /still open/i);
+	assert.match(rejectedMessage(validateRerunGoal(goal({ status: "active" }))), /goal-tweak/);
+	assert.deepEqual(validateRerunGoal(goal({ status: "complete", autoContinue: false })), { ok: true });
+});
+
+function rerunSource(overrides: Partial<GoalRecord> = {}): GoalRecord {
+	return {
+		...createGoalForRerun(),
+		...overrides,
+	};
+}
+
+function createGoalForRerun(): GoalRecord {
+	return {
+		id: "src-goal",
+		objective: "Export the CSV reports",
+		status: "complete",
+		autoContinue: true,
+		usage: { tokensUsed: 1500, activeSeconds: 300 },
+		sisyphus: false,
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T01:00:00.000Z",
+		archivedPath: ".pi/goals/archived/goal_20260101_src-goal.md",
+		tokenBudget: 90000,
+	};
+}
+
+test("buildRerunSummary renders the bounded pre-draft summary", () => {
+	const source = rerunSource({
+		taskList: {
+			tasks: [
+				{ id: "t1", title: "Read the CSV", status: "complete", verificationContract: "file exists" },
+				{ id: "t2", title: "Write the export", status: "pending", subtasks: [{ id: "t2a", title: "Nested", status: "pending" }] },
+			],
+			blockCompletion: false,
+			proposedAt: "2026-01-01T00:00:00.000Z",
+		},
+	});
+	const rendered = { detailedSummary: detailedSummary(source), usageLines: usageLines(source) };
+	const summary = buildRerunSummary({
+		source,
+		...rendered,
+		auditResult: { verdict: "approved", report: "Looks good", at: "2026-01-01T01:00:00.000Z" },
+	});
+	assert.match(summary, /Objective: Export the CSV reports/);
+	assert.match(summary, /Last audit: approved \(2026-01-01\) — Looks good/);
+	assert.match(summary, /Plan: 3 tasks \(1 subtask\), 1 with verification contracts/);
+	assert.match(summary, /Budget: 90000 tokens/);
+	assert.match(summary, /Archives preserved: \.pi\/goals\/archived\/goal_20260101_src-goal\.md/);
+
+	// Without an audit, the summary says so; completion summary surfaces when present.
+	const noAudit = buildRerunSummary({ source, ...rendered, completionSummary: "Export shipped" });
+	assert.match(noAudit, /Last audit: none recorded/);
+	assert.match(noAudit, /Completion summary: Export shipped/);
+
+	// Bounded: a pathological report cannot blow up the dialog.
+	const huge = "x".repeat(5000);
+	assert.ok(buildRerunSummary({ source, ...rendered, auditResult: { verdict: "approved", report: huge, at: "2026-01-01T01:00:00.000Z" } }).length <= 1203);
+});
+
+test("buildRerunProvenance snapshots the source run, omitting absent audit data", () => {
+	const source = rerunSource();
+	const withAudit = buildRerunProvenance(source, { verdict: "disapproved", report: "a".repeat(700), at: "2026-01-01T01:00:00.000Z" }, "ignored when audit present", "2026-01-02T00:00:00.000Z");
+	assert.deepEqual(withAudit, {
+		goalId: "src-goal",
+		archivedPath: ".pi/goals/archived/goal_20260101_src-goal.md",
+		at: "2026-01-02T00:00:00.000Z",
+		summary: "a".repeat(500),
+		auditVerdict: "disapproved",
+	});
+
+	const withCompletionOnly = buildRerunProvenance(source, undefined, "Export shipped", "2026-01-02T00:00:00.000Z");
+	assert.deepEqual(withCompletionOnly, {
+		goalId: "src-goal",
+		archivedPath: ".pi/goals/archived/goal_20260101_src-goal.md",
+		at: "2026-01-02T00:00:00.000Z",
+		summary: "Export shipped",
+	});
+
+	const bare = buildRerunProvenance(source, undefined, undefined, "2026-01-02T00:00:00.000Z");
+	assert.deepEqual(bare, { goalId: "src-goal", archivedPath: ".pi/goals/archived/goal_20260101_src-goal.md", at: "2026-01-02T00:00:00.000Z" });
+	assert.ok(!("summary" in bare) && !("auditVerdict" in bare));
 });

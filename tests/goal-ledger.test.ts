@@ -406,3 +406,34 @@ test("task_skipped event round-trips correctly", () => {
 		cleanup(ctx);
 	}
 });
+
+test("goal_created accepts optional rerunOf string and tolerates its absence", () => {
+	const ctx = tempCtx();
+	try {
+		appendGoalEvent(ctx, { type: "goal_created", goalId: "sib", objective: "sibling", sisyphus: false, autoContinue: true, rerunOf: "src-goal", at: new Date().toISOString() });
+		appendGoalEvent(ctx, { type: "goal_created", goalId: "plain", objective: "plain", sisyphus: false, autoContinue: true, at: new Date().toISOString() });
+		const result = readGoalLedger(ctx);
+		assert.equal(result.malformed, 0);
+		assert.equal(result.events.length, 2);
+		const withRerun = result.events[0]!;
+		if (withRerun.type === "goal_created") assert.equal(withRerun.rerunOf, "src-goal");
+		const without = result.events[1]!;
+		if (without.type === "goal_created") assert.equal(without.rerunOf, undefined);
+	} finally {
+		cleanup(ctx);
+	}
+});
+
+test("goal_created with a non-string rerunOf is counted as malformed", () => {
+	const ctx = tempCtx();
+	try {
+		const ledgerPath = goalLedgerPath(ctx);
+		fs.mkdirSync(path.dirname(ledgerPath), { recursive: true });
+		fs.writeFileSync(ledgerPath, `{"type":"goal_created","goalId":"g1","objective":"x","sisyphus":false,"autoContinue":true,"rerunOf":42,"at":"2024-01-01T00:00:00.000Z"}\n`, "utf8");
+		const result = readGoalLedger(ctx);
+		assert.equal(result.events.length, 0);
+		assert.equal(result.malformed, 1);
+	} finally {
+		cleanup(ctx);
+	}
+});

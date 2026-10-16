@@ -537,6 +537,73 @@ function scanActiveGoalFiles(ctx: GoalFileContext, root: string): GoalRecord[] {
 		.filter((goal): goal is GoalRecord => goal !== null);
 }
 
+/**
+ * Read-only scan of .pi/goals/archived for rerunnable (complete) goals.
+ * Mirrors scanActiveGoalFiles but uncached (user-command cadence) and filtered
+ * to `complete`: cleared (/goal-clear) and aborted goals are archived too with
+ * a non-complete status, and only completed goals are rerunnable (PRODUCT.md).
+ */
+export function scanArchivedGoalFiles(ctx: GoalFileContext): GoalRecord[] {
+	const root = goalStoragePath(ctx, ARCHIVED_GOALS_DIR);
+	let entries: string[];
+	try {
+		const rootStat = fs.lstatSync(root);
+		if (rootStat.isSymbolicLink()) { if (isExternalGoalStorage(ctx)) throw new Error(`Goal root is a symlink: ${root}`); return []; }
+		entries = fs.readdirSync(root).filter((name) => /^goal_.*\.md$/.test(name)).sort((a, b) => a.localeCompare(b));
+	} catch (error) {
+		if (isExternalGoalStorage(ctx)) throw error;
+		return [];
+	}
+	return entries
+		.map((name) => {
+			const relPath = `${ARCHIVED_GOALS_DIR}/${name}`;
+			if (!isSafeArchivedPath(ctx, relPath)) return null;
+			// parseGoalFile requires an ABSOLUTE path; always resolve via resolveGoalPath.
+			const parsed = parseGoalFile(resolveGoalPath(ctx, ARCHIVED_GOALS_DIR, relPath));
+			if (!parsed || parsed.status !== "complete") return null;
+			return sanitizeGoalPaths(ctx, { ...parsed, archivedPath: relPath });
+		})
+		.filter((goal): goal is GoalRecord => goal !== null)
+		.sort((a, b) => archivedTimestamp(b.archivedPath) - archivedTimestamp(a.archivedPath));
+}
+
+/** Newest-first selector ordering: parse the goal_<timestamp>_<id>.md prefix; foreign names sort last. */
+function archivedTimestamp(relPath: string | undefined): number {
+	if (!relPath) return 0;
+	const match = relPath.match(/goal_(\d{14,17})_/);
+	if (!match) return 0;
+	const stamp = match[1] ?? "";
+	// Lexical/numeric compare of the local-time filename stamp — ordering only, no timezone interpretation.
+	return Number(stamp) || 0;
+}
+
+export interface RerunTargetResolution {
+	/** Complete goals matching the argument (all of them when the argument is empty). */
+	matches: GoalRecord[];
+	/** All complete archived goals found by the scan (candidates for the tweak-text selector). */
+	all: GoalRecord[];
+	/** Set when a non-empty argument matched nothing — the argument is tweak text. */
+	tweak?: string;
+	/** Total complete archived goals found. */
+	total: number;
+}
+
+/**
+ * Resolve /goal-rerun's argument against the complete archived goals. Goal ids
+ * are opaque base36, so an unmatched argument is unambiguously free-text tweak.
+ */
+export function resolveRerunTarget(ctx: GoalFileContext, arg: string | undefined): RerunTargetResolution {
+	const all = scanArchivedGoalFiles(ctx);
+	const trimmed = (arg ?? "").trim();
+	if (!trimmed) return { matches: all, all, total: all.length };
+	const exact = all.filter((goal) => goal.id === trimmed);
+	if (exact.length > 0) return { matches: exact, all, total: all.length };
+	const needle = trimmed.toLowerCase();
+	const matches = all.filter((goal) => goal.id.toLowerCase().includes(needle) || goal.objective.toLowerCase().includes(needle));
+	if (matches.length > 0) return { matches, all, total: all.length };
+	return { matches: [], all, tweak: trimmed, total: all.length };
+}
+
 export function readActiveGoalPoolView(ctx: GoalFileContext): ReadonlyMap<string, GoalRecord> {
  const root = goalStoragePath(ctx, GOALS_DIR);
  const cached = goalPoolCache.get(root);

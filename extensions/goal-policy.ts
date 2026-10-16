@@ -1,5 +1,5 @@
-import { statusLabel, type GoalDisplayRecordLike } from "./goal-core.ts";
-import type { GoalTask, GoalTaskList, TaskStatus } from "./goal-record.ts";
+import { statusLabel, truncateText, displayObjectiveTitle, type GoalDisplayRecordLike } from "./goal-core.ts";
+import type { GoalRerunProvenance, GoalRecord, GoalTask, GoalTaskList, TaskStatus } from "./goal-record.ts";
 import { countTaskSubtree } from "./goal-task-count.ts";
 
 export type GoalStatusLike = "active" | "paused" | "blocked" | "budget_limited" | "complete";
@@ -367,4 +367,101 @@ export function shouldArmPostCompactReminder(goal: Pick<GoalPolicyRecordLike, "s
 
 export function shouldInjectPostCompactReminder(args: { pending: boolean; goal: Pick<GoalPolicyRecordLike, "sisyphus"> | null }): boolean {
 	return args.pending && !!args.goal;
+}
+
+/**
+ * /goal-rerun guard: only a COMPLETED goal may be rerun. Every rejection
+ * points at the right existing command for that status (PRODUCT.md).
+ */
+export function validateRerunGoal(goal: GoalPolicyRecordLike | null): PolicyValidation {
+	if (!goal) return { ok: false, message: "No completed goal to rerun. Use /goal to draft a new one." };
+	if (goal.status === "paused") return { ok: false, message: "Goal is paused. Use /goal-resume to continue it." };
+	if (goal.status === "blocked") return { ok: false, message: "Goal is blocked. Use /goal-resume once the blocker is cleared." };
+	if (goal.status === "budget_limited") return { ok: false, message: "Goal is budget-limited. Use /goal-resume (or /goal-tweak to raise the budget) to continue it." };
+	if (goal.status === "active") return { ok: false, message: "Goal is still open. Use /goal-tweak to revise it, or /goal-clear before rerunning." };
+	return { ok: true };
+}
+
+function countTaskNodes(tasks: readonly GoalTask[] | undefined): number {
+	if (!tasks) return 0;
+	let count = 0;
+	for (const task of tasks) {
+		count += 1 + countTaskNodes(task.subtasks);
+	}
+	return count;
+}
+
+function countContractedTasks(tasks: readonly GoalTask[] | undefined): number {
+	if (!tasks) return 0;
+	let count = 0;
+	for (const task of tasks) {
+		if (task.verificationContract?.trim()) count++;
+		count += countContractedTasks(task.subtasks);
+	}
+	return count;
+}
+
+export interface RerunSummaryArgs {
+	source: GoalRecord;
+	/** Last audit_result for the source goal, when one was recorded. */
+	auditResult?: { verdict: "approved" | "disapproved" | "error"; report: string; at: string };
+	/** Last completion_requested.summary for the source goal, when present. */
+	completionSummary?: string;
+	/** Pre-rendered detailedSummary(source) — caller renders so goal-policy stays free of goal-format. */
+	detailedSummary: string;
+	/** Pre-rendered usageLines(source). */
+	usageLines: string[];
+}
+
+/**
+ * Bounded pre-draft summary shown in the /goal-rerun confirmation dialog
+ * (PRODUCT.md): objective, completion, last audit, plan shape, budget/usage,
+ * and the archive files that will be preserved.
+ */
+export function buildRerunSummary(args: RerunSummaryArgs): string {
+	const { source } = args;
+	const lines: string[] = [];
+	lines.push(`Objective: ${truncateText(displayObjectiveTitle(source.objective), 120)}`);
+	lines.push(`Status/completion: ${args.detailedSummary}`);
+	if (args.completionSummary?.trim()) lines.push(`Completion summary: ${truncateText(args.completionSummary, 120)}`);
+	if (args.auditResult) {
+		lines.push(`Last audit: ${args.auditResult.verdict} (${args.auditResult.at.slice(0, 10)}) — ${truncateText(args.auditResult.report, 120)}`);
+	} else {
+		lines.push("Last audit: none recorded");
+	}
+	const tasks = source.taskList?.tasks;
+	const nodes = countTaskNodes(tasks);
+	const topLevel = tasks?.length ?? 0;
+	const contracted = countContractedTasks(tasks);
+	const subtaskCount = nodes - topLevel;
+	lines.push(`Plan: ${nodes} tasks (${subtaskCount} ${subtaskCount === 1 ? "subtask" : "subtasks"}), ${contracted} with verification contracts`);
+	lines.push(`${formatGoalBudget(source.tokenBudget)} | ${args.usageLines.join(" | ")}`);
+	const archives = source.archivedPath ? [source.archivedPath] : [];
+	if (source.rerunOf?.archivedPath) archives.push(source.rerunOf.archivedPath);
+	if (archives.length > 0) lines.push(`Archives preserved: ${archives.join(", ")}`);
+	const summary = lines.join("\n");
+	// Keep the confirm dialog readable.
+	return summary.length > 1200 ? `${summary.slice(0, 1197)}...` : summary;
+}
+
+/**
+ * Snapshot of the source run carried onto the sibling's rerunOf provenance so
+ * provenance and the pre-draft summary agree. Audit report wins over the
+ * completion summary; both omitted when the source finished without either.
+ */
+export function buildRerunProvenance(
+	source: GoalRecord,
+	auditResult: { verdict: "approved" | "disapproved" | "error"; report: string; at: string } | undefined,
+	completionSummary: string | undefined,
+	at: string,
+): GoalRerunProvenance {
+	const summarySource = auditResult?.report ?? completionSummary;
+	const summary = typeof summarySource === "string" && summarySource.trim() ? summarySource.slice(0, 500) : undefined;
+	return {
+		goalId: source.id,
+		archivedPath: source.archivedPath ?? "",
+		at,
+		...(auditResult ? { auditVerdict: auditResult.verdict } : {}),
+		...(summary ? { summary } : {}),
+	};
 }

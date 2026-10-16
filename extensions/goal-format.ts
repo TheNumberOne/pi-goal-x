@@ -329,6 +329,12 @@ export function isMeaningfulProgressToolCall(toolName: string, args: unknown): b
 export function buildGoalHistoryBlock(goal: GoalRecord | null, ledgerEvents: GoalLedgerEvent[]): string {
 	if (!goal) return "";
 	const lines: string[] = [];
+	// /goal-rerun provenance: shown without any archive read (PRODUCT.md §get_goal).
+	if (goal.rerunOf) {
+		const verdict = goal.rerunOf.auditVerdict ? ` — last audit: ${goal.rerunOf.auditVerdict}` : "";
+		lines.push(`Rerun of: ${goal.rerunOf.goalId} — archive ${goal.rerunOf.archivedPath}${verdict}`);
+		if (goal.rerunOf.summary?.trim()) lines.push(`  Prior run: ${truncateText(goal.rerunOf.summary, 200)}`);
+	}
 	const audit = latestAuditorResultForGoal(ledgerEvents, goal.id);
 	if (audit) {
 		lines.push(`Last audit: ${audit.verdict} (${audit.at.slice(0, 10)}) — ${truncateText(audit.report, 90)}`);

@@ -6,7 +6,7 @@
  * guided refinement under focus races, and headless auto-confirm semantics.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import goalExtension from "../extensions/goal.ts";
-import { parseGoalFile, writeActiveGoalFile } from "../extensions/storage/goal-files.ts";
+import { parseGoalFile, writeActiveGoalFile, archiveGoalFile } from "../extensions/storage/goal-files.ts";
 import { readGoalLedger } from "../extensions/goal-ledger.ts";
 import { goalSettingsPath } from "../extensions/goal-settings.ts";
 import { proposalText, DRAFT_ENTRY, type ActiveGoalDraft } from "../extensions/goal-drafting.ts";
@@ -1409,3 +1409,251 @@ for (const unavailable of [false, true]) {
 		} finally { rmSync(cwd, { recursive: true, force: true }); }
 	});
 }
+
+// ── /goal-rerun drafting (seeded sibling draft) ─────────────────────────────
+
+function archiveRerunSource(cwd: string, overrides: Partial<GoalRecord> = {}): GoalRecord {
+	const goal = createGoal({ objective: overrides.objective ?? "Rerunnable source objective", autoContinue: true, sisyphus: false }, Date.UTC(2026, 0, 2, 3, 4, 5));
+	return archiveGoalFile({ cwd }, { ...goal, status: "complete", ...overrides });
+}
+
+async function startRerunDraft(h: Harness, arg = ""): Promise<void> {
+	(h.ctx.ui as { select: unknown }).select = async (_title: string, labels: string[]) => labels[0];
+	(h.ctx.ui as { confirm: unknown }).confirm = async () => true;
+	await h.commands.get("goal-rerun")!.handler(arg, h.ctx);
+}
+
+test("the rerun seed prompt pre-fills the prior objective, tweak, plan contracts, budget, and audit result", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-seed-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		const source = archiveRerunSource(cwd, {
+			objective: "Migrate the exporter to the new API",
+			sisyphus: false,
+			tokenBudget: 5000,
+			verificationContract: "npm test (0 failures)",
+			taskList: { blockCompletion: false, proposedAt: "2026-01-02T00:00:00Z", tasks: [
+				{ id: "t1", title: "Port the reader", status: "complete", verificationContract: "unit tests pass" },
+				{ id: "t2", title: "Port the writer", status: "skipped", skipReason: "deferred to next run" },
+				{ id: "t3", title: "Cut the release", status: "pending" },
+			] },
+		});
+		appendFileSync(path.join(cwd, ".pi", "goals", "goal_events.jsonl"), JSON.stringify({ type: "audit_result", goalId: source.id, verdict: "approved", report: "The run met every verification contract.", at: "2026-01-03T00:00:00Z" }) + "\n");
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h, "focus on the parser this time");
+		const seed = h.messages.find((m) => m.includes("[GOAL RERUN DRAFT]"));
+		assert.ok(seed, "rerun seed prompt sent");
+		assert.ok(seed!.includes("Migrate the exporter to the new API"), "prior objective present");
+		assert.ok(seed!.includes("focus on the parser this time"), "tweak text present");
+		assert.ok(seed!.includes("Requested changes:"), "tweak section present");
+		assert.ok(seed!.includes("[x] Port the reader") && seed!.includes("contract: unit tests pass"), "prior task + contract present");
+		assert.ok(seed!.includes("[~] Port the writer"), "skipped task marked with source status");
+		assert.ok(seed!.includes("[ ] Cut the release"), "pending task marked");
+		assert.ok(seed!.includes("npm test (0 failures)"), "prior goal-level contract present");
+		assert.ok(seed!.includes("Budget: 5000 tokens"), "carried budget present as proposed default");
+		assert.ok(seed!.includes("approved"), "audit verdict present");
+		assert.ok(seed!.includes("The run met every verification contract."), "audit report excerpt present");
+		assert.ok(seed!.includes("sisyphus=false"), "source mode instruction present");
+		// Structural: the seed is a multi-line prompt, one line per task, and ENDS with the
+		// protocol + focus items (bounding must never drop the trailing blocks).
+		assert.match(seed!, /\[GOAL RERUN DRAFT\]\n/, "seed header ends with a newline");
+		assert.match(seed!, /\[x\] Port the reader contract: unit tests pass\n/, "per-task line ends with a newline");
+		assert.match(seed!, /Call propose_goal_draft[\s\S]*$/, "the common protocol tail survived bounding");
+		assert.ok(seed!.trimEnd().endsWith("Call propose_goal_draft with sisyphus=false and autoContinue=true unless the user asked otherwise."), "seed ends with the focus-items block");
+		assert.equal(activeGoalFiles(cwd).length, 0);
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("goal_question and the drafting profile work in rerun mode", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-question-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		archiveRerunSource(cwd, {});
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		assert.deepEqual(h.activeTools().filter((n) => n.startsWith("goal_") || n === "propose_goal_draft"), ["goal_question", "goal_questionnaire", "propose_goal_draft"]);
+		const pending = h.tools.get("goal_question").execute("q1", { question: "What changes this run?" }, new AbortController().signal, undefined, h.ctx);
+		h.dialogResult({ questions: [], answers: [{ id: "question", question: "What changes this run?", answer: "Only the parser", wasCustom: false }], cancelled: false });
+		const result = await pending;
+		assert.match(result.content[0].text, /Only the parser/);
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("rerun proposal: the sisyphus gate uses the SOURCE mode, not the draft mode", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-gate-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		archiveRerunSource(cwd, { objective: "Ordered sisyphus run.\n1. Step one — done when built.\n2. Step two — done when tested.", sisyphus: true });
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		const mismatch = await runProposal(h, proposalParams("Ordered sisyphus run.\n1. Step one — done when built.\n2. Step two — done when tested.", { sisyphus: false }));
+		assert.match(mismatch.content[0].text, /Proposal mode does not match/);
+		// Sisyphus-source rerun is held to the structural-sufficiency check too.
+		const insufficient = await runProposal(h, proposalParams("Just wing it", { sisyphus: true }));
+		assert.match(insufficient.content[0].text, /Sisyphus goal needs ordered steps/);
+		// The dialog must present the rerun as Sisyphus (G6), and confirming succeeds.
+		const pending = runProposal(h, proposalParams("Ordered sisyphus run.\n1. Step one — done when built.\n2. Step two — done when tested.", { sisyphus: true }));
+		assert.ok(h.hasDialog(), "confirmation dialog opens");
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Sisyphus Goal Draft", answer: CONFIRM_ANSWER, wasCustom: false }], cancelled: false });
+		await pending;
+		const created = firstGoal(cwd);
+		assert.equal(created.sisyphus, true, "source mode preserved in the sibling");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("proposalText renders a rerun like a sisyphus draft and never shows Budget: none when the budget carries over (G6/G7)", () => {
+	const source = { id: "src", sisyphus: true, tokenBudget: 5000 } as unknown as GoalRecord;
+	const draft: ActiveGoalDraft = { mode: "rerun", originalTopic: "tweak it", targetGoalId: "src", startedAt: "now", auditorEnabled: true };
+	const text = proposalText(draft, "New objective.", true, undefined, source, undefined);
+	assert.match(text, /Mode: Sisyphus/);
+	assert.match(text, /Proposed Budget: 5000 tokens/);
+	assert.doesNotMatch(text, /Budget: none/);
+});
+
+test("rerun confirm: budget defaults to the source budget, is user-overridable, and the sibling is a fresh focused record with rerunOf provenance", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-confirm-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		const source = archiveRerunSource(cwd, { objective: "Carry the budget", tokenBudget: 5000 });
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		const pending = runProposal(h, proposalParams("Carry the budget, again. Success criteria: works."));
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Goal Draft", answer: CONFIRM_ANSWER, wasCustom: false }], cancelled: false });
+		await pending;
+		const created = firstGoal(cwd);
+		assert.notEqual(created.id, source.id, "fresh id");
+		assert.equal(created.status, "active");
+		assert.equal(created.usage.tokensUsed, 0, "fresh lifetime allocation");
+		assert.equal(created.tokenBudget, 5000, "carried source budget");
+		assert.equal(created.sisyphus, false, "source mode preserved");
+		assert.ok(created.rerunOf, "rerunOf populated");
+		assert.equal(created.rerunOf!.goalId, source.id);
+		assert.equal(created.rerunOf!.archivedPath, source.archivedPath);
+		const createdEvent = ledgerEvents(cwd).find((e) => e.type === "goal_created");
+		assert.ok(createdEvent, "goal_created event written");
+		assert.equal((createdEvent as { rerunOf?: string }).rerunOf, source.id, "ledger carries the rerunOf provenance");
+		assert.ok(!h.activeTools().includes("propose_goal_draft"), "execution profile restored");
+		assert.ok(h.activeTools().includes("update_goal"));
+
+		// Budget override: a fresh draft with an explicit token_budget wins.
+		await startRerunDraft(h);
+		const pending2 = runProposal(h, proposalParams("Carry the budget, again. Success criteria: works.", { token_budget: 1234 }));
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Goal Draft", answer: CONFIRM_ANSWER, wasCustom: false }], cancelled: false });
+		await pending2;
+		const seconds = activeGoalFiles(cwd).map((f) => parseGoalFile(path.join(cwd, ".pi", "goals", f))!).filter((g) => g.id !== created.id);
+		assert.equal(seconds.length, 1);
+		assert.equal(seconds[0]!.tokenBudget, 1234, "user-overridable budget");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("rerun continue-chatting and rehydration keep the draft usable and create nothing (G1)", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-continue-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		const source = archiveRerunSource(cwd, { objective: "Keep the draft alive", tokenBudget: 900 });
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		// Continue chatting: no goal created, draft stays active.
+		const pending = runProposal(h, proposalParams("Keep the draft alive, v2. Success criteria: works."));
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Goal Draft", answer: CONTINUE_ANSWER, wasCustom: false }], cancelled: false });
+		await pending;
+		assert.equal(activeGoalFiles(cwd).length, 0, "continue creates nothing");
+		assert.ok(h.activeTools().includes("propose_goal_draft"), "draft still active after continue");
+		// Rehydration (G1): the durable entry must carry the rerun source across session_tree.
+		await h.sessionTree();
+		assert.ok(h.activeTools().includes("propose_goal_draft"), "drafting profile re-installed after rehydration");
+		const pending2 = runProposal(h, proposalParams("Keep the draft alive, v3. Success criteria: works."));
+		assert.ok(h.hasDialog(), "rerun draft still usable after rehydration");
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Goal Draft", answer: CONFIRM_ANSWER, wasCustom: false }], cancelled: false });
+		await pending2;
+		const created = firstGoal(cwd);
+		assert.equal(created.rerunOf!.goalId, source.id, "rehydrated draft still knows its source");
+		assert.equal(created.tokenBudget, 900, "carried budget survives rehydration");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("rerun dialog cancel creates nothing", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-proposal-cancel-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		archiveRerunSource(cwd, {});
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		const pending = runProposal(h, proposalParams("Cancelled rerun. Success criteria: nothing happens."));
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Goal Draft", answer: CANCEL_ANSWER, wasCustom: false }], cancelled: false });
+		await pending;
+		assert.equal(activeGoalFiles(cwd).length, 0, "no goal file created");
+		assert.deepEqual(ledgerEvents(cwd).filter((e) => e.type === "goal_created"), [], "no goal_created event");
+		assert.ok(!h.activeTools().includes("propose_goal_draft"), "drafting tools removed");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("rerun confirm with the source archive deleted or moved aborts and KEEPS the draft", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-gone-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		const source = archiveRerunSource(cwd, {});
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		// Deleted between confirm and creation.
+		const archivePath = path.join(cwd, source.archivedPath!);
+		const archiveBytes = readFileSync(archivePath, "utf8");
+		rmSync(archivePath);
+		const pending = runProposal(h, proposalParams("Source is gone. Success criteria: abort."));
+		assert.ok(!h.hasDialog(), "no confirm dialog for a dead rerun source");
+		const result = await pending;
+		assert.match(result.content[0].text, /no longer available as a completed archive/);
+		assert.equal(activeGoalFiles(cwd).length, 0, "no goal created");
+		assert.ok(h.activeTools().includes("propose_goal_draft"), "draft kept alive after the abort");
+		// Moved (renamed) out of the flat archived root: same no-dialog abort-and-keep behavior.
+		writeFileSync(archivePath, archiveBytes);
+		mkdirSync(path.join(cwd, ".pi", "goals", "archived", "moved"), { recursive: true });
+		renameSync(path.join(cwd, source.archivedPath!), path.join(cwd, ".pi", "goals", "archived", "moved", "goal_moved.md"));
+		const pending2 = runProposal(h, proposalParams("Source is gone. Success criteria: abort."));
+		assert.ok(!h.hasDialog(), "no confirm dialog after the source archive moved");
+		const result2 = await pending2;
+		assert.match(result2.content[0].text, /no longer available as a completed archive/);
+		assert.equal(activeGoalFiles(cwd).length, 0);
+		assert.ok(h.activeTools().includes("propose_goal_draft"), "draft still alive");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("rerun never mutates the source archive file", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-readonly-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		const source = archiveRerunSource(cwd, { objective: "Untouched source" });
+		const archiveFile = path.join(cwd, source.archivedPath!);
+		const before = readFileSync(archiveFile, "utf8");
+		const h = createHarness(cwd, { hasUI: true });
+		await h.sessionStart();
+		await startRerunDraft(h);
+		const pending = runProposal(h, proposalParams("Untouched source, again. Success criteria: works."));
+		h.dialogResult({ questions: [], answers: [{ id: "confirm", question: "Confirm Goal Draft", answer: CONFIRM_ANSWER, wasCustom: false }], cancelled: false });
+		await pending;
+		assert.equal(readFileSync(archiveFile, "utf8"), before, "source archive bytes unchanged");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
