@@ -1,4 +1,4 @@
-# Product: `/goal-resume` optional trailing text delivered to the agent verbatim
+# Product: /goal-resume optional trailing text delivered to the agent verbatim
 
 ## Status
 
@@ -21,10 +21,13 @@ dropped, which reads like it was sent to the agent but was not.
   byte-identically to today: nothing is sent to the agent.
 - Text is delivered **before** the resume logic, including before every
   early-return path (no focused goal, focus-picker cancellation, scheduler
-  resume returning false). The user's text is therefore never dropped, even
-  when the resume path fails or finds nothing to resume.
-- A delivery failure (sendUserMessage throwing) shows an error notification
+  resume returning false), so the text is never dropped.
+- A delivery failure (`sendUserMessage` throwing) shows an error notification
   and does **not** block the resume; resume continues normally.
+
+## Boundaries
+
+No resume semantics, notification text, or ledger events change.
 
 ## Ordering rationale
 

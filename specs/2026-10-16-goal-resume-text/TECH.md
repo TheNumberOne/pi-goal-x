@@ -1,4 +1,4 @@
-# Tech: `/goal-resume` optional trailing text
+# Tech: /goal-resume optional trailing text
 
 ## Files touched
 
@@ -8,6 +8,7 @@
 | `README.md` | Command table row mentions optional trailing text |
 | `tests/goal-resume-text.test.ts` | Delivery coverage |
 | `tests/.test-manifest.json` | New unit entry registered via `--write-manifest` |
+| `CHANGELOG.md` | [Unreleased] Added entry |
 
 ## Delivery (`goal-commands.ts`)
 
@@ -24,16 +25,11 @@ if (text) {
 }
 ```
 
-Same delivery pattern as `goal-drafting.ts:182`. Whitespace-only args count
-as no text. Delivery precedes every early return (no focused goal, picker
-cancellation, `scheduler.resume` returning false) so text is never dropped;
-a delivery throw only notifies and continues to resume. The in-file comment
-at the delivery block records the ordering rationale: busy path, the steered
-message enters pi's pending queue so `sendQueuedContinuation` waits for it;
-idle path, the message starts a user turn and `agent_start` →
-`GoalScheduler.begin()` cancels the armed kickoff timer — ordering is
-best-effort, and an inverted dispatch still delivers the text as a followUp
-(no message loss).
+Same delivery pattern as `goal-drafting.ts:182`. Delivery precedes every
+early return (no focused goal, picker cancellation, `scheduler.resume`
+returning false) so text is never dropped. The in-file comment at the
+delivery block records the ordering rationale; PRODUCT.md "Ordering
+rationale" carries the full version.
 
 Realistic `sendUserMessage` failures (missing model, auth, compaction in
 progress) reject asynchronously and surface through pi's own extension-error
