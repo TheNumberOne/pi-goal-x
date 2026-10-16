@@ -74,11 +74,11 @@ const EXPECTED_REGISTERED_TOOLS = [
 ] as const;
 
 /**
- * The 10 slash commands registered today (the curated Stage 5 palette):
- * /goal and /sisyphus are the two direct creation paths (bare /goal shows
- * status); the remaining eight are dedicated lifecycle commands. The five
- * legacy/aliased commands (/goal-status, /goals, /goals-set, /sisyphus-set,
- * /goal-abort) are removed with documented mappings.
+ * The slash commands registered today (the curated Stage 5 palette plus the
+ * lifecycle commands, including /goal-rerun): /goal and /sisyphus are the two
+ * direct drafting paths (bare /goal shows status); the rest are dedicated
+ * lifecycle commands. The five legacy/aliased commands (/goal-status, /goals,
+ * /goals-set, /sisyphus-set, /goal-abort) are removed with documented mappings.
  */
 const EXPECTED_REGISTERED_COMMANDS = [
 	"goal",
@@ -95,6 +95,7 @@ const EXPECTED_REGISTERED_COMMANDS = [
 	"goal-settings",
 	"goal-tweak",
 	"goal-clear",
+	"goal-rerun",
 	"goal-pause",
 	"goal-resume",
 ] as const;
@@ -106,7 +107,7 @@ test("baseline: execution and drafting tools are registered in pinned order", ()
 	assert.deepEqual(registeredTools, [...EXPECTED_REGISTERED_TOOLS]);
 });
 
-test("baseline: exactly 16 slash commands are registered, in pinned order", () => {
+test("baseline: exactly 17 slash commands are registered, in pinned order", () => {
 	const { pi, registeredCommands } = createRecordingPi();
 	piGoalExtension(pi as never);
 

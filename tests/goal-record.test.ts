@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -10,6 +13,7 @@ import {
 	type GoalCreationConfig,
 	type GoalTaskList,
 } from "../extensions/goal-record.ts";
+import { parseGoalFile, serializeGoalFile } from "../extensions/storage/goal-files.ts";
 
 const baseConfig: GoalCreationConfig = {
 	objective: "=== Goal ===\nObjective: ship the refactor",
@@ -190,4 +194,75 @@ test("goal focus entries persist only session focus metadata", () => {
 		reason: "selected",
 	});
 	assert.equal(normalizeGoalFocusEntry({ version: 3, focusedGoalId: "abc" }), null);
+});
+
+test("rerunOf provenance round-trips through normalizeGoalRecord and serialize/parse", () => {
+	const provenance = {
+		goalId: "src-goal",
+		archivedPath: ".pi/goals/archived/goal_20260101000000_src-goal.md",
+		at: "2026-05-01T00:00:00.000Z",
+		summary: "Finished the first run.",
+		auditVerdict: "approved" as const,
+	};
+	const normalized = normalizeGoalRecord({ ...createGoal(baseConfig), rerunOf: provenance });
+	assert.ok(normalized);
+	assert.deepEqual(normalized.rerunOf, provenance);
+
+	const roundTripped = normalizeGoalRecord(JSON.parse(JSON.stringify(normalized)));
+	assert.ok(roundTripped);
+	assert.deepEqual(roundTripped.rerunOf, provenance);
+
+	// Persisted round-trip: serializeGoalFile → parseGoalFile keeps the provenance.
+	const tmpDir = mkdtempSync(path.join(tmpdir(), "goal-record-rerun-"));
+	try {
+		const filePath = path.join(tmpDir, "goal.md");
+		writeFileSync(filePath, serializeGoalFile(normalized), "utf8");
+		const parsed = parseGoalFile(filePath);
+		assert.ok(parsed);
+		assert.deepEqual(parsed.rerunOf, provenance);
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("a record without rerunOf normalizes with the key absent and is never added on rewrite", () => {
+	const normalized = normalizeGoalRecord(createGoal(baseConfig));
+	assert.ok(normalized);
+	assert.ok(!("rerunOf" in normalized), "rerunOf must be absent for goals not created by /goal-rerun");
+
+	const rewritten = normalizeGoalRecord(JSON.parse(JSON.stringify(normalized)));
+	assert.ok(rewritten);
+	assert.ok(!("rerunOf" in rewritten), "rewriting a historical record must not add rerunOf");
+});
+
+test("malformed rerunOf values are dropped safely without discarding the record", () => {
+	const base = createGoal(baseConfig);
+	const cases: Array<{ rerunOf: unknown; expect?: Partial<Record<string, unknown>> }> = [
+		{ rerunOf: "x" },
+		{ rerunOf: {} },
+		{ rerunOf: { goalId: "", archivedPath: ".pi/goals/archived/g.md" } },
+		{ rerunOf: { goalId: "src", archivedPath: "" } },
+		// Non-essential fields are dropped but the rest of the provenance is kept.
+		{ rerunOf: { goalId: "src", archivedPath: ".pi/goals/archived/g.md", auditVerdict: "maybe" }, expect: { auditVerdict: undefined } },
+		{ rerunOf: { goalId: "src", archivedPath: ".pi/goals/archived/g.md", summary: 42 }, expect: { summary: undefined } },
+	];
+	for (const { rerunOf, expect } of cases) {
+		const normalized = normalizeGoalRecord({ ...base, rerunOf });
+		assert.ok(normalized, `record must survive rerunOf: ${JSON.stringify(rerunOf)}`);
+		if (!expect) {
+			assert.ok(!("rerunOf" in normalized), `rerunOf must be dropped for ${JSON.stringify(rerunOf)}`);
+		} else {
+			assert.ok(normalized.rerunOf);
+			for (const key of Object.keys(expect)) {
+				assert.equal((normalized.rerunOf as unknown as Record<string, unknown>)[key], undefined, `${key} must be dropped`);
+			}
+		}
+	}
+});
+
+test("createGoal copies rerunOf only when provided", () => {
+	const provenance = { goalId: "src", archivedPath: ".pi/goals/archived/g.md", at: "2026-05-01T00:00:00.000Z" };
+	const withProvenance = createGoal({ ...baseConfig, rerunOf: provenance });
+	assert.deepEqual(withProvenance.rerunOf, provenance);
+	assert.ok(!("rerunOf" in createGoal(baseConfig)));
 });

@@ -11,22 +11,25 @@ import assert from "node:assert/strict";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import goalExtension from "../extensions/goal.ts";
-import { parseGoalFile } from "../extensions/storage/goal-files.ts";
+import { archiveGoalFile, parseGoalFile } from "../extensions/storage/goal-files.ts";
+import { createGoal, type GoalRecord } from "../extensions/goal-record.ts";
 
 const CURATED_COMMANDS = [
 	"goal", "sisyphus", "goal-direct", "sisyphus-direct", "goal-tweak", "goal-pause", "goal-resume",
-	"goal-clear", "goal-list", "goal-status", "goal-refresh", "goal-recovery", "goal-focus", "goal-unfocus", "goal-settings", "goal-cancel",
+	"goal-clear", "goal-rerun", "goal-list", "goal-status", "goal-refresh", "goal-recovery", "goal-focus", "goal-unfocus", "goal-settings", "goal-cancel",
 ];
 
 const REMOVED_COMMANDS = ["goals", "goals-set", "sisyphus-set", "goal-abort"];
 
-function createHarness(cwd: string) {
+function createHarness(cwd: string, opts: { hasUI?: boolean; autoAcceptSelect?: boolean } = {}) {
 	const handlers = new Map<string, Function>();
 	const commands = new Map<string, any>();
 	const notifications: string[] = [];
 	const messages: string[] = [];
 	const tools = new Map<string, any>();
 	let activeTools = ["read", "bash", "edit", "write"];
+	let selectCalls = 0;
+	const hasUI = opts.hasUI ?? false;
 	const pi = {
 		registerTool: (def: any) => { tools.set(def.name, def); },
 		registerCommand: (name: string, def: any) => { commands.set(name, def); },
@@ -37,11 +40,11 @@ function createHarness(cwd: string) {
 		sendMessage: () => {},
 		getActiveTools: () => [...activeTools],
 		setActiveTools: (names: string[]) => { activeTools = [...names]; },
-		hasUI: false,
+		hasUI,
 	};
 	const ctx = {
 		cwd,
-		hasUI: false,
+		hasUI,
 		sessionManager: {
 			getBranch: () => [] as unknown[],
 			getCwd: () => cwd,
@@ -53,7 +56,12 @@ function createHarness(cwd: string) {
 			setStatus: () => {},
 			setWidget: () => {},
 			onTerminalInput: () => () => {},
-			select: async () => undefined,
+			// Headless default: nothing is selected. Tests that reach the rerun selector pass
+			// autoAcceptSelect to accept the first option (and still count the invocation).
+			select: async (_title: string, labels: string[]) => {
+				selectCalls++;
+				return opts.autoAcceptSelect ? labels[0] : undefined;
+			},
 			confirm: async () => false,
 			custom: async () => undefined,
 		},
@@ -63,7 +71,7 @@ function createHarness(cwd: string) {
 		abort: () => {},
 	} as unknown as ExtensionContext;
 	goalExtension(pi as any, {});
-	return { handlers, commands, ctx, notifications, messages, tools, getActiveTools: () => [...activeTools] };
+	return { handlers, commands, ctx, notifications, messages, tools, getActiveTools: () => [...activeTools], selectCalls: () => selectCalls };
 }
 
 function activeGoalFiles(cwd: string): string[] {
@@ -74,7 +82,7 @@ function activeGoalFiles(cwd: string): string[] {
 	}
 }
 
-test("exactly the fourteen curated commands are registered; legacy commands are absent", () => {
+test("exactly the seventeen curated commands are registered; legacy commands are absent", () => {
 	const cwd = mkdtempSync(path.join(tmpdir(), "goal-palette-"));
 	try {
 		const h = createHarness(cwd);
@@ -365,4 +373,122 @@ test("goal-settings: execution-contract opt-in can be set and removed through th
    assert.equal(saved.strictExecutionContract, action === "Use inherited value" ? undefined : action.endsWith("true"));
   }
  } finally { rmSync(cwd, {recursive: true, force: true}); }
+});
+
+// ── /goal-rerun command layer ────────────────────────────────────────────────
+
+function archiveRerunSource(cwd: string, overrides: Partial<GoalRecord> = {}, now = Date.UTC(2026, 0, 2, 3, 4, 5)): GoalRecord {
+	const goal = createGoal({ objective: overrides.objective ?? "Rerunnable source objective", autoContinue: true, sisyphus: false }, now);
+	return archiveGoalFile({ cwd }, { ...goal, status: "complete", ...overrides });
+}
+
+test("/goal-rerun with no completed goals is a warning and starts nothing", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-empty-"));
+	try {
+		const h = createHarness(cwd);
+		await h.handlers.get("session_start")?.({ reason: "start" }, h.ctx);
+		await h.commands.get("goal-rerun")!.handler("", h.ctx);
+		assert.ok(h.notifications.some((n) => n.includes("No completed goals to rerun.")));
+		assert.equal(h.messages.length, 0, "no drafting prompt sent");
+		assert.equal(activeGoalFiles(cwd).length, 0, "no goal created");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("/goal-rerun on a non-UI host is rejected before any dialog, draft, or mutation", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-headless-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		for (const objective of ["first archived run", "second archived run"]) archiveRerunSource(cwd, { objective });
+		const h = createHarness(cwd);
+		await h.handlers.get("session_start")?.({ reason: "start" }, h.ctx);
+		await h.commands.get("goal-rerun")!.handler("", h.ctx);
+		assert.ok(h.notifications.some((n) => n.includes("interactive session")));
+		assert.equal(h.selectCalls(), 0, "selector never reached on a headless host");
+		assert.equal(h.messages.length, 0, "no drafting prompt sent");
+		assert.equal(activeGoalFiles(cwd).length, 0, "no goal created");
+		assert.equal(h.getActiveTools().filter((n) => n === "propose_goal_draft").length, 0, "no drafting profile installed");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("/goal-rerun single match shows the selector, then summary + confirm starts the rerun draft", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-single-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		const source = archiveRerunSource(cwd, { objective: "Deploy the staging build" });
+		const h = createHarness(cwd, { hasUI: true, autoAcceptSelect: true });
+		(h.ctx.ui as { confirm: unknown }).confirm = async () => true;
+		await h.handlers.get("session_start")?.({ reason: "start" }, h.ctx);
+		await h.commands.get("goal-rerun")!.handler("", h.ctx);
+		assert.equal(h.selectCalls(), 1, "selector is shown even for a single match");
+		assert.equal(h.notifications.some((n) => n.includes("Goal rerun cancelled.")), false);
+		assert.ok(h.messages.some((m) => m.includes("[GOAL RERUN DRAFT]")), "rerun seed prompt sent");
+		assert.ok(h.messages[0]!.includes("Deploy the staging build"));
+		assert.ok(h.messages[0]!.includes(`sisyphus=false`));
+		assert.equal(activeGoalFiles(cwd).length, 0, "drafting does not create before confirmation");
+		assert.ok(h.getActiveTools().includes("propose_goal_draft"));
+		void source;
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("/goal-rerun cancel at the selector and at the confirm creates nothing", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-cancel-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		archiveRerunSource(cwd, { objective: "Only one completed goal" });
+		const h = createHarness(cwd, { hasUI: true });
+		await h.handlers.get("session_start")?.({ reason: "start" }, h.ctx);
+		// Selector cancel (default select returns labels[0]; override to cancel).
+		(h.ctx.ui as { select: unknown }).select = async () => undefined;
+		await h.commands.get("goal-rerun")!.handler("", h.ctx);
+		assert.ok(h.notifications.some((n) => n.includes("Goal rerun cancelled.")));
+		assert.equal(h.messages.length, 0);
+		// Confirm cancel.
+		(h.ctx.ui as { select: unknown }).select = async (_t: string, labels: string[]) => labels[0];
+		await h.commands.get("goal-rerun")!.handler("", h.ctx);
+		assert.equal(h.messages.length, 0, "confirm cancel starts no draft");
+		assert.equal(activeGoalFiles(cwd).length, 0);
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("/goal-rerun with a non-matching argument treats it as tweak and still offers the selector", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-tweak-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		archiveRerunSource(cwd, { objective: "Ship the widget" });
+		const h = createHarness(cwd, { hasUI: true, autoAcceptSelect: true });
+		(h.ctx.ui as { confirm: unknown }).confirm = async () => true;
+		await h.handlers.get("session_start")?.({ reason: "start" }, h.ctx);
+		await h.commands.get("goal-rerun")!.handler("this time also update the docs", h.ctx);
+		assert.equal(h.selectCalls(), 1, "selector shown over all complete goals");
+		const seed = h.messages.find((m) => m.includes("[GOAL RERUN DRAFT]"));
+		assert.ok(seed, "rerun draft started");
+		assert.ok(seed!.includes("this time also update the docs"), "unmatched argument becomes tweak text");
+		assert.ok(seed!.includes("Requested changes:"));
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
+});
+
+test("/goal-rerun never offers non-complete archives (cleared/paused goals)", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "goal-rerun-paused-"));
+	mkdirSync(path.join(cwd, ".pi", "goals", "archived"), { recursive: true });
+	try {
+		// /goal-clear archives a non-complete goal with status "paused".
+		archiveRerunSource(cwd, { objective: "cleared goal", status: "paused" });
+		const h = createHarness(cwd);
+		await h.handlers.get("session_start")?.({ reason: "start" }, h.ctx);
+		await h.commands.get("goal-rerun")!.handler("", h.ctx);
+		assert.ok(h.notifications.some((n) => n.includes("No completed goals to rerun.")));
+		assert.equal(h.selectCalls(), 0, "no selector when nothing is rerunnable");
+	} finally {
+		try { rmSync(cwd, { recursive: true, force: true }); } catch {}
+	}
 });

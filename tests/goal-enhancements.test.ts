@@ -38,6 +38,24 @@ describe("E1 goal history block", () => {
 	});
 });
 
+describe("E1 goal history block — rerun provenance", () => {
+	it("prepends rerun provenance when present and renders nothing when absent", () => {
+		const goal = makeGoalRecord({ objective: "Rerun provenance test" });
+		assert.ok(!buildGoalHistoryBlock(goal, ledgerEvents(goal.id) as never).includes("Rerun of:"));
+
+		const rerunGoal = { ...goal, rerunOf: {
+			goalId: "src-goal",
+			archivedPath: ".pi/goals/archived/goal_20260101_src-goal.md",
+			at: "2026-01-01T00:00:00.000Z",
+			summary: "First run finished with a disapproved audit.",
+			auditVerdict: "disapproved" as const,
+		} };
+		const block = buildGoalHistoryBlock(rerunGoal, ledgerEvents(rerunGoal.id) as never);
+		assert.match(block, /Rerun of: src-goal — archive \.pi\/goals\/archived\/goal_20260101_src-goal\.md — last audit: disapproved/);
+		assert.match(block, /Prior run: First run finished with a disapproved audit\./);
+	});
+});
+
 describe("E6 sisyphus step progress", () => {
 	it("counts ordered steps from numbered markers", () => {
 		assert.equal(countOrderedSteps("1. do this\n2. do that\n3. done"), 3);

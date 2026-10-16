@@ -907,6 +907,7 @@ export function createGoalCore(
 				objective: goal.objective,
 				sisyphus: goal.sisyphus,
 				autoContinue: goal.autoContinue,
+				...(goal.rerunOf ? { rerunOf: goal.rerunOf.goalId } : {}),
 				at: goal.createdAt,
 			},
 			...(goal.taskList ? [{

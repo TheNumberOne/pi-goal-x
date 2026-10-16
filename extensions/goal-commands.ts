@@ -22,13 +22,16 @@ import {
 	goalSelectorLabel,
 	otherOpenGoalCount,
 } from "./goal-pool.ts";
-import { clearGoalCommandMessage, validateResumeGoal } from "./goal-policy.ts";
-import { invalidateGoalLedgerCache, readGoalLedger } from "./goal-ledger.ts";
+import { clearGoalCommandMessage, validateResumeGoal, validateRerunGoal, buildRerunSummary } from "./goal-policy.ts";
+import { invalidateGoalLedgerCache, latestAuditorResultForGoal, readGoalLedger } from "./goal-ledger.ts";
 import { buildGoalStatusText } from "./goal-status.ts";
 import { effectiveSettingsReport, invalidateGoalSettingsCache, loadGoalSettingsFileConfig } from "./goal-settings.ts";
-import { invalidateGoalPoolCache, mergeGoalPromptFromDisk, readActiveGoalPool } from "./storage/goal-files.ts";
+import { invalidateGoalPoolCache, mergeGoalPromptFromDisk, readActiveGoalPool, ARCHIVED_GOALS_DIR, isSafeArchivedPath, parseGoalFile, resolveGoalPath, resolveRerunTarget } from "./storage/goal-files.ts";
 import { nowIso, type GoalMode, type GoalRecord } from "./goal-record.ts";
-import { clearGoalDrafting, hasActiveDraft, startGoalDrafting } from "./goal-drafting.ts";
+import { clearGoalDrafting, hasActiveDraft, lastCompletionSummary, startGoalDrafting } from "./goal-drafting.ts";
+import { goalRerunDraftingPrompt } from "./goal-draft.ts";
+import { displayObjectiveTitle, truncateText } from "./goal-core.ts";
+import { usageLines } from "./goal-format.ts";
 import { formatRecoveryReport, runRecoveryReport, runRecoveryRepair } from "./goal-recovery.ts";
 import { formatCheckpointHealthReport, readSessionCheckpointHealth } from "./goal-session-health.ts";
 
@@ -696,6 +699,94 @@ export function registerGoalCommands(core: GoalCore): void {
 		ctx.ui.notify(msg, didArchive ? "info" : "warning");
 	}
 
+	// §rerun: bounded target selector modeled on chooseOpenGoal but WITHOUT any
+	// focus mutation — a completed source must never become the focused goal.
+	async function chooseRerunSource(ctx: ExtensionContext, candidates: GoalRecord[]): Promise<GoalRecord | null> {
+		const total = candidates.length;
+		const shown = candidates.slice(0, 20);
+		if (total > 20) ctx.ui.notify(`Showing the 20 most recently archived of ${total} completed goals.`, "info");
+		const labels = shown.map((goal) => {
+			const mode = goal.sisyphus ? "sisyphus" : "goal";
+			return `${goal.id} | complete | ${mode} | ${truncateText(displayObjectiveTitle(goal.objective), 72)}${goal.archivedPath ? ` ${goal.archivedPath}` : ""}`;
+		});
+		const byLabel = new Map(labels.map((label, index) => [label, shown[index]!]));
+		core.enterGoalModal();
+		try {
+			const selected = await ctx.ui.select("Rerun which completed goal?", labels);
+			const source = selected ? byLabel.get(selected) : undefined;
+			if (!source) {
+				ctx.ui.notify("Goal rerun cancelled.", "info");
+				return null;
+			}
+			return source;
+		} finally {
+			core.exitGoalModal();
+		}
+	}
+
+	async function handleGoalRerun(rawArgs: string, ctx: ExtensionContext): Promise<void> {
+		const arg = (rawArgs ?? "").trim();
+		const resolution = resolveRerunTarget(ctx, arg);
+		if (resolution.total === 0) {
+			ctx.ui.notify(arg
+				? "No completed goals to rerun. (Your argument was kept as a tweak, but there is nothing to rerun yet.)"
+				: "No completed goals to rerun.", "warning");
+			return;
+		}
+		// §rerun (G9): reject non-UI hosts BEFORE any dialog and before any draft
+		// starts — no mutation, no drafting profile, nothing.
+		if (!ctx.hasUI) {
+			const one = resolution.matches[0];
+			ctx.ui.notify(`Run /goal-rerun in an interactive session to confirm the rerun${one ? `: ${oneLineSummary(one)}` : ""}.`, "warning");
+			return;
+		}
+		// An argument that matched nothing is tweak text — the selector still runs over ALL complete goals (G11);
+		// reuse the full scan already captured by resolveRerunTarget instead of a second scan.
+		const candidates = resolution.matches.length > 0 ? resolution.matches : resolution.all;
+		const source = await chooseRerunSource(ctx, candidates);
+		if (!source) return; // selector cancel changes nothing
+		const validation = validateRerunGoal(source);
+		if (!validation.ok) {
+			ctx.ui.notify(validation.message, "warning");
+			return;
+		}
+		const auditResult = latestAuditorResultForGoal(readGoalLedger(ctx).events, source.id);
+		const completionSummary = lastCompletionSummary(ctx, source.id);
+		const summary = buildRerunSummary({ source, auditResult, completionSummary, detailedSummary: detailedSummary(source), usageLines: usageLines(source) });
+		const confirmed = await ctx.ui.confirm("Rerun this goal?", summary);
+		if (!confirmed) {
+			ctx.ui.notify("Goal rerun cancelled.", "info");
+			return;
+		}
+		// Re-read the source from disk after confirmation (guards a stale selection).
+		const relPath = source.archivedPath;
+		const fresh = relPath && isSafeArchivedPath(ctx, relPath)
+			? parseGoalFile(resolveGoalPath(ctx, ARCHIVED_GOALS_DIR, relPath))
+			: undefined;
+		const revalidated = validateRerunGoal(fresh ?? null);
+		if (!fresh || !revalidated.ok) {
+			ctx.ui.notify("The source goal changed while confirming; no draft was started.", "warning");
+			return;
+		}
+		const seedPrompt = goalRerunDraftingPrompt({
+			sourceGoalId: fresh.id,
+			sourceObjective: fresh.objective,
+			tweak: resolution.tweak,
+			tasks: fresh.taskList?.tasks,
+			verificationContract: fresh.verificationContract,
+			tokenBudget: fresh.tokenBudget,
+			sisyphus: fresh.sisyphus === true,
+			auditVerdict: auditResult?.verdict,
+			// §rerun: the completion flow bounds audit reports to 600 chars; mirror that bound here.
+			auditReportExcerpt: auditResult?.report.slice(0, 600),
+			completionSummaryExcerpt: completionSummary?.slice(0, 600),
+			usageLines: usageLines(fresh),
+		});
+		// The standard guided draft does the rest: seed prompt, propose_goal_draft,
+		// confirmation dialog, and sibling creation on Confirm.
+		await startGoalDrafting(core, ctx, "rerun", resolution.tweak ?? `Rerun of ${fresh.id}`, fresh, { sourceArchivedPath: relPath!, seedPrompt });
+	}
+
 	async function runGoalTweak(replacement: string, ctx: ExtensionContext): Promise<void> {
 		core.reconcileFocusedGoalFromDisk(ctx);
 		if (!core.state.goal) {
@@ -815,6 +906,12 @@ export function registerGoalCommands(core: GoalCore): void {
 		description: "Archive the current goal after confirmation (user-owned abandonment).",
 		handler: async (_rawArgs, ctx) => {
 			await handleGoalClear(ctx);
+		},
+	});
+	pi.registerCommand("goal-rerun", {
+		description: "Rerun a completed goal as a new sibling goal through guided drafting, seeded from the archived run.",
+		handler: async (rawArgs, ctx) => {
+			await handleGoalRerun(rawArgs, ctx);
 		},
 	});
 	pi.registerCommand("goal-pause", {

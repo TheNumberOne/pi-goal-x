@@ -90,7 +90,7 @@ in place.
 
 ## 5. Command palette: the user owns intent
 
-The curated fourteen-command palette:
+The curated seventeen-command palette:
 
 | Command | Behavior |
 |---|---|
@@ -105,6 +105,7 @@ The curated fourteen-command palette:
 | `/goal-settings` | Fully operable settings editor for all eight persisted fields |
 | `/goal-tweak <change>` | Guided, user-confirmed refinement of the focused objective and task plan |
 | `/goal-clear` | Archive the focused goal after confirmation (cancel is a durable no-op) |
+| `/goal-rerun [target|tweak]` | Rerun a completed goal as a new sibling goal through guided drafting, seeded from the archived run |
 | `/goal-cancel` | Cancel the in-progress guided draft without creating a goal |
 | `/goal-pause` | Pause the focused active goal (Esc also pauses) |
 | `/goal-resume` | Resume a paused or blocked goal |
@@ -125,7 +126,7 @@ temporarily replaces it with three draft tools:
 - exactly five goal tools are installed when tasks are enabled — `create_goal`,
   `get_goal`, `update_goal`, `set_goal_tasks`, `update_goal_task`;
 - exactly the three core tools when tasks are disabled;
-- during a user-started `/goal`, `/sisyphus`, or `/goal-tweak` draft, only
+- during a user-started `/goal`, `/sisyphus`, `/goal-tweak`, or `/goal-rerun` draft, only
   `goal_question`, `goal_questionnaire`, and `propose_goal_draft` are
   advertised until confirm or cancellation;
 - the profile is installed once at session start and after a settings change
