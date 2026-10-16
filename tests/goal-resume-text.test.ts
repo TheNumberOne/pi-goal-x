@@ -73,7 +73,7 @@ function pausedGoalFixture(cwd: string, core: any, ctx: ExtensionContext): GoalR
 	};
 	writeActiveGoalFile(ctx, goal);
 	core.reconcileFocusedGoalFromDisk(ctx);
-	core.setFocusedGoalId(goal.id, ctx, "selected");
+	core.setFocusedGoalId(goal.id, ctx, "selected", { recordLedger: false });
 	return goal;
 }
 
